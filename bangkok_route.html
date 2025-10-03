@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>曼谷路线规划｜茉莉花豪华公寓 环线</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .legend {
+      background: rgba(255,255,255,0.95);
+      padding: 10px 12px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+      max-width: 320px;
+    }
+    .legend h4 { font-size: 14px; margin: 0 0 6px; }
+    .legend .muted { color: #666; font-size: 12px; }
+    .legend .row { margin: 6px 0; }
+    .legend .total { font-weight: 700; }
+    .legend .tip { color: #444; font-size: 12px; margin-top: 6px; }
+
+    .distance-label {
+      background: rgba(0,0,0,0.6);
+      color: #fff; padding: 2px 6px; border-radius: 4px;
+      white-space: nowrap; font-size: 12px;
+      border: 1px solid rgba(255,255,255,0.25);
+    }
+
+    .marker-index {
+      background: #0b5; color: #fff; border-radius: 999px;
+      width: 24px; height: 24px; display: grid; place-items: center;
+      font-weight: 700; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    // 基础数据（顺序按你的要求）：茉莉花豪华公寓 → 郑王庙 → 王权云顶大厦玻璃观景台 → 暹罗天地 → 卧佛寺 → 回到茉莉花豪华公寓
+    const POIS = [
+      { id: 'start', name: '茉莉花豪华公寓（起终点，可拖动）', queryNames: ['茉莉花豪华公寓 曼谷', 'Jasmine Grande Residence Bangkok', 'Jasmine City Hotel Bangkok', 'Jasmine Resort Hotel Bangkok'] },
+      { id: 'wat_arun', name: '郑王庙（Wat Arun）', lat: 13.7437, lng: 100.4889 },
+      { id: 'mahanakhon', name: '王权云顶大厦玻璃观景台（Mahanakhon Skywalk）', lat: 13.7234, lng: 100.5296 },
+      { id: 'iconsiam', name: '暹罗天地（ICONSIAM）', lat: 13.7261, lng: 100.5107 },
+      { id: 'wat_pho', name: '卧佛寺（Wat Pho）', lat: 13.7466, lng: 100.4944 },
+    ];
+
+    // 如果地理编码失败，起点的备用坐标（大致位于素坤逸中段一带）
+    const START_FALLBACK = { lat: 13.7165, lng: 100.5905, source: 'fallback' };
+
+    const TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const TILE_ATTR = '© OpenStreetMap 贡献者 | 路径服务：OSRM 公共 API';
+
+    const map = L.map('map');
+    L.tileLayer(TILE_URL, { attribution: TILE_ATTR, maxZoom: 19 }).addTo(map);
+
+    let startMarker = null;
+    let fixedMarkers = [];
+    let routeLayers = [];
+    let labelLayers = [];
+
+    const legendControl = L.control({ position: 'topright' });
+    legendControl.onAdd = function() {
+      this._div = L.DomUtil.create('div', 'legend');
+      this.update([]);
+      return this._div;
+    };
+    legendControl.update = function(segments) {
+      const total = segments.reduce((s, seg) => s + (seg.distanceMeters || 0), 0);
+      const km = (m) => (m >= 1000 ? (m/1000).toFixed(2) + ' km' : m.toFixed(0) + ' m');
+      const rows = segments.map(seg => `
+        <div class="row">${seg.from} → ${seg.to}：<b>${km(seg.distanceMeters)}</b>${seg.mode ? ` <span class="muted">(${seg.mode})</span>` : ''}</div>
+      `).join('');
+      this._div.innerHTML = `
+        <h4>环线距离</h4>
+        <div class="total">总里程：${km(total)}</div>
+        ${rows}
+        <div class="tip">提示：可拖动起点标记重新计算；需联网加载底图与路径。</div>
+      `;
+    };
+    legendControl.addTo(map);
+
+    function clearLayers() {
+      routeLayers.forEach(l => map.removeLayer(l));
+      labelLayers.forEach(l => map.removeLayer(l));
+      routeLayers = []; labelLayers = [];
+    }
+
+    function addIndexMarker(latlng, index, title) {
+      const icon = L.divIcon({ className: '', html: `<div class="marker-index">${index}</div>` });
+      const m = L.marker(latlng, { icon, title });
+      m.addTo(map);
+      fixedMarkers.push(m);
+      return m;
+    }
+
+    function addDistanceLabel(latlng, text) {
+      const icon = L.divIcon({ className: 'distance-label', html: text });
+      const m = L.marker(latlng, { icon, interactive: false });
+      m.addTo(map);
+      labelLayers.push(m);
+    }
+
+    function midOfLine(a, b) {
+      return L.latLng((a.lat + b.lat)/2, (a.lng + b.lng)/2);
+    }
+
+    function toLatLng(obj) {
+      return L.latLng(obj.lat, obj.lng);
+    }
+
+    function haversineMeters(a, b) {
+      const R = 6371000; // meters
+      const toRad = (d) => d * Math.PI / 180;
+      const dLat = toRad(b.lat - a.lat);
+      const dLng = toRad(b.lng - a.lng);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const sinDLat = Math.sin(dLat/2), sinDLng = Math.sin(dLng/2);
+      const h = sinDLat*sinDLat + Math.cos(lat1)*Math.cos(lat2)*sinDLng*sinDLng;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+    }
+
+    async function geocodeFirst(queries) {
+      for (const q of queries) {
+        try {
+          const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+          const res = await fetch(url, { headers: { 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' } });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (Array.isArray(data) && data.length > 0) {
+            return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), source: q };
+          }
+        } catch (e) { /* ignore and try next */ }
+      }
+      return START_FALLBACK;
+    }
+
+    async function osrmRoute(a, b) {
+      const url = `https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('OSRM error');
+      const json = await res.json();
+      if (!json || !json.routes || !json.routes[0]) throw new Error('No route');
+      const r = json.routes[0];
+      const coords = r.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      return { distance: r.distance, coords };
+    }
+
+    async function drawAll(startLatLng) {
+      clearLayers();
+
+      // 组装顺序：start → wat_arun → mahanakhon → iconsiam → wat_pho → start
+      const ordered = [
+        { name: POIS[0].name, ...startLatLng },
+        { name: POIS[1].name, lat: POIS[1].lat, lng: POIS[1].lng },
+        { name: POIS[2].name, lat: POIS[2].lat, lng: POIS[2].lng },
+        { name: POIS[3].name, lat: POIS[3].lat, lng: POIS[3].lng },
+        { name: POIS[4].name, lat: POIS[4].lat, lng: POIS[4].lng },
+        { name: POIS[0].name, ...startLatLng },
+      ];
+
+      // 标号标记（1..5：按到达顺序；起终点单独一个可拖动标记）
+      fixedMarkers.forEach(m => map.removeLayer(m));
+      fixedMarkers = [];
+      addIndexMarker(ordered[1], 1, ordered[1].name);
+      addIndexMarker(ordered[2], 2, ordered[2].name);
+      addIndexMarker(ordered[3], 3, ordered[3].name);
+      addIndexMarker(ordered[4], 4, ordered[4].name);
+
+      if (startMarker) map.removeLayer(startMarker);
+      startMarker = L.marker(startLatLng, { draggable: true, title: ordered[0].name }).addTo(map);
+      startMarker.bindPopup('起终点：可拖动后自动重新计算');
+      startMarker.on('dragend', () => {
+        const ll = startMarker.getLatLng();
+        drawAll({ lat: ll.lat, lng: ll.lng });
+      });
+
+      const bounds = L.latLngBounds([ordered[0], ordered[1], ordered[2], ordered[3], ordered[4]]);
+
+      const segments = [];
+      const kmText = (m) => (m >= 1000 ? (m/1000).toFixed(2) + ' km' : m.toFixed(0) + ' m');
+
+      for (let i = 0; i < ordered.length - 1; i++) {
+        const a = ordered[i], b = ordered[i+1];
+        try {
+          const r = await osrmRoute(a, b);
+          const poly = L.polyline(r.coords.map(toLatLng), { color: '#1976d2', weight: 5, opacity: 0.85 }).addTo(map);
+          routeLayers.push(poly);
+          const mid = r.coords[Math.floor(r.coords.length / 2)] || midOfLine(a, b);
+          addDistanceLabel(mid, kmText(r.distance));
+          segments.push({ from: a.name, to: b.name, distanceMeters: r.distance, mode: '驾车路径' });
+          r.coords.forEach(c => bounds.extend(c));
+        } catch (e) {
+          // 回退为直线距离
+          const straight = L.polyline([toLatLng(a), toLatLng(b)], { color: '#999', weight: 4, dashArray: '6,6' }).addTo(map);
+          routeLayers.push(straight);
+          const d = haversineMeters(a, b);
+          addDistanceLabel(midOfLine(a, b), '直线 ' + kmText(d));
+          segments.push({ from: a.name, to: b.name, distanceMeters: d, mode: '直线' });
+          bounds.extend(a); bounds.extend(b);
+        }
+      }
+
+      map.fitBounds(bounds.pad(0.15));
+      legendControl.update(segments);
+    }
+
+    (async function init() {
+      // 解析起点（尝试多种写法），失败则使用备用坐标
+      const start = await geocodeFirst(POIS[0].queryNames);
+      await drawAll({ lat: start.lat, lng: start.lng });
+    })();
+  </script>
+</body>
+</html>
